@@ -121,6 +121,24 @@ for (let i = 0; i < N; i++) {
   const [from, to] = r < 0.35 ? [HOME, PLACES[2]] : r < 0.6 ? [PLACES[2], HOME] : r < 0.7 ? [HOME, HOME] : r < 0.85 ? [HOME, pick(PLACES.slice(1))] : [pick(PLACES.slice(1)), HOME];
   trips.push(trip(day.getTime(), from, to));
 }
+// Fill-ups: full tank every ~550-700 km at the end of a trip, now and then a partial one.
+const STATIONS = ['Shell Utrechtseweg', 'Esso Veldzigt', 'Tango Ravenswade', 'BP Waterlinieweg', 'TotalEnergies Biltstraat'];
+const fuel = [];
+let sinceFull = 0, nextAt = 0;
+trips.forEach((t, i) => {
+  sinceFull += t.distanceM / 1000;
+  if (i === 0 || sinceFull >= nextAt) {
+    const month = new Date(t.startTime).getMonth() + new Date(t.startTime).getFullYear() * 12;
+    const price = 1.86 + 0.12 * Math.sin(month / 3) + (rnd() - 0.5) * 0.06;
+    const partial = i > 0 && rnd() < 0.12;
+    const liters = i === 0 ? 38 : sinceFull * (6.1 + (rnd() - 0.5) * 1.1) / 100 * (partial ? 0.5 : 1);
+    t.fuelStation = pick(STATIONS);
+    fuel.push({ type: 'fuel', time: t.endTime, liters: +liters.toFixed(2), euros: +(liters * price).toFixed(2), full: !partial,
+      station: t.fuelStation, tripStart: t.startTime });
+    if (!partial) { sinceFull = 0; nextAt = 550 + rnd() * 150; }
+  }
+});
+
 const best = trips.reduce((a, t) => (t.maxSpeedKmh > a.maxSpeedKmh ? t : a));
 best.recordsSet = 'top_speed';
 const longest = trips.reduce((a, t) => (t.distanceM > a.distanceM ? t : a));
@@ -128,7 +146,8 @@ longest.recordsSet = longest.recordsSet ? longest.recordsSet + ',longest_trip' :
 
 const lines = [
   { type: 'header', format: 'triptrack-backup', version: 1, exported: end, trips: trips.length },
-  { type: 'car', car: { plate: 'XX-000-X', brand: 'VOLKSWAGEN', model: 'GOLF', fuel: 'Benzine' } },
+  { type: 'car', car: { plate: 'XX-000-X', brand: 'VOLKSWAGEN', model: 'GOLF', fuel: 'Benzine', consumptionL100: 5.4 } },
+  ...fuel,
   { type: 'record', key: 'top_speed', value: best.maxSpeedKmh, time: best.startTime },
   { type: 'record', key: 'longest_trip', value: longest.distanceM / 1000, time: longest.startTime },
   { type: 'record', key: 'zero_100', value: 8.4, time: best.startTime },

@@ -197,7 +197,7 @@ function addTrip(o, data) {
 
 /** A backup file (.ttbackup) or the web index (index.tte, trips without GPS points). */
 async function parseBackup(blob, onProgress) {
-  const data = { header: null, car: null, records: [], segments: [], trips: [] };
+  const data = { header: null, car: null, records: [], segments: [], trips: [], fuel: [] };
   let first = true;
   await readLines(blob, (o) => {
     if (first) {
@@ -210,6 +210,7 @@ async function parseBackup(blob, onProgress) {
       case 'car': data.car = o.car; break;
       case 'record': data.records.push(o); break;
       case 'segment': data.segments.push(o); break;
+      case 'fuel': data.fuel.push(o); break;
       case 'trip': addTrip(o, data); break;
     }
   }, onProgress);
@@ -471,7 +472,7 @@ function route() {
   cleanup();
   hideTip();
   const [view = 'overzicht', arg] = location.hash.replace(/^#\/?/, '').split('/');
-  const views = { overzicht: viewOverview, ritten: viewTrips, rit: viewTrip, kaart: viewMap, records: viewRecords };
+  const views = { overzicht: viewOverview, ritten: viewTrips, rit: viewTrip, verbruik: viewFuel, kaart: viewMap, records: viewRecords };
   const fn = views[view] || viewOverview;
   setNav(view === 'rit' ? 'ritten' : views[view] ? view : 'overzicht');
   els.view.innerHTML = '';
@@ -1080,6 +1081,198 @@ function viewMap() {
     }
     if (group.getLayers().length) map.fitBounds(group.getBounds(), { padding: [30, 30] });
     else map.setView([52.15, 5.3], 7);
+  };
+  render();
+}
+
+// ---------------------------------------------------------------- fuel (ported from FuelStats.kt)
+
+/** Full-to-full consumption: liters of a full tank (plus partial fills since) over the km since the previous full tank. */
+function fuelSummary(fills, trips) {
+  const sorted = [...fills].sort((a, b) => a.time - b.time);
+  const ends = trips.map((t) => [t.endTime ?? t.startTime, t.distanceM]);
+  const intervals = [];
+  let lastFull = null, liters = 0;
+  for (const f of sorted) {
+    liters += f.liters;
+    if (f.full === false) continue;
+    if (lastFull) {
+      const km = ends.filter(([e]) => e > lastFull.time && e <= f.time).reduce((s, [, m]) => s + m, 0) / 1000;
+      if (km >= 30) intervals.push({ endTime: f.time, km, liters, l100: (liters / km) * 100 });
+    }
+    lastFull = f;
+    liters = 0;
+  }
+  const lastPriced = [...sorted].reverse().find((f) => f.liters > 0);
+  return { sorted, intervals, lastPrice: lastPriced ? lastPriced.euros / lastPriced.liters : null };
+}
+
+const avgOf = (intervals) => {
+  const km = intervals.reduce((s, i) => s + i.km, 0);
+  return km > 0 ? (intervals.reduce((s, i) => s + i.liters, 0) / km) * 100 : null;
+};
+
+/** Generic SVG bar chart with hover tooltips; bars: [{ value, label, tip }]. */
+function svgBars(el, bars, { avg = null, fmtAxis = (v) => fmt.num(v), labelEvery = 1, onClick = null, width = 1000 } = {}) {
+  const W = width, H = 240, padL = 44, padB = 30, padT = 10;
+  const max = Math.max(...bars.map((b) => b.value), avg ?? 0, 1e-9);
+  const step = niceStep(max / 4);
+  const top = Math.ceil((max * 1.05) / step) * step;
+  const bw = (W - padL) / Math.max(bars.length, 1);
+  const y = (v) => padT + (H - padT - padB) * (1 - v / top);
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img">`;
+  for (let v = 0; v <= top + 1e-9; v += step) {
+    svg += `<line class="grid-line" x1="${padL}" x2="${W}" y1="${y(v)}" y2="${y(v)}"/><text class="axis" x="${padL - 8}" y="${y(v) + 4}" text-anchor="end">${fmtAxis(v)}</text>`;
+  }
+  bars.forEach((b, i) => {
+    const x = padL + i * bw;
+    const barW = Math.min(bw * 0.64, 64);
+    svg += `<rect class="bar" data-i="${i}" x="${x + (bw - barW) / 2}" y="${y(b.value)}" width="${barW}" height="${Math.max(H - padB - y(b.value), b.value > 0 ? 2 : 0)}" rx="${Math.min(4, bw * 0.2)}"/>`;
+    svg += `<rect data-i="${i}" x="${x}" y="${padT}" width="${bw}" height="${H - padT - padB}" fill="transparent"${onClick ? ' style="cursor:pointer"' : ''}/>`;
+    if (i % labelEvery === 0) svg += `<text class="axis" x="${x + bw / 2}" y="${H - padB + 18}" text-anchor="middle">${esc(b.label)}</text>`;
+  });
+  if (avg != null) svg += `<line x1="${padL}" x2="${W}" y1="${y(avg)}" y2="${y(avg)}" stroke="var(--blue-light)" stroke-width="2" stroke-dasharray="8 7"/>`;
+  svg += '</svg>';
+  el.innerHTML = svg;
+  const rects = $$('.bar', el);
+  el.addEventListener('mousemove', (e) => {
+    const i = e.target.dataset?.i;
+    rects.forEach((r) => r.classList.toggle('on', r.dataset.i === i));
+    if (i == null) { hideTip(); return; }
+    showTip(e.clientX, e.clientY, bars[+i].tip);
+  });
+  el.addEventListener('mouseleave', () => { hideTip(); rects.forEach((r) => r.classList.remove('on')); });
+  if (onClick) el.addEventListener('click', (e) => { const i = e.target.dataset?.i; if (i != null) onClick(bars[+i]); });
+  onLeave(hideTip);
+}
+
+/** SVG line with dots over time; points: [{ t, value, tip }]. */
+function svgLine(el, points, { fmtAxis = (v) => fmt.num(v, 2), width = 1000 } = {}) {
+  const W = width, H = 240, padL = 52, padB = 30, padT = 14;
+  const vals = points.map((p) => p.value);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const pad = Math.max((hi - lo) * 0.15, 0.03);
+  lo -= pad; hi += pad;
+  const t0 = points[0].t, span = Math.max(points[points.length - 1].t - t0, 1);
+  const x = (t) => padL + ((t - t0) / span) * (W - padL - 12);
+  const y = (v) => padT + (H - padT - padB) * (1 - (v - lo) / (hi - lo));
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img">`;
+  for (let k = 0; k <= 3; k++) {
+    const v = lo + ((hi - lo) * k) / 3;
+    svg += `<line class="grid-line" x1="${padL}" x2="${W}" y1="${y(v)}" y2="${y(v)}"/><text class="axis" x="${padL - 8}" y="${y(v) + 4}" text-anchor="end">${fmtAxis(v)}</text>`;
+  }
+  svg += `<polyline fill="none" stroke="var(--blue)" stroke-width="2.5" stroke-linejoin="round" points="${points.map((p) => `${x(p.t)},${y(p.value)}`).join(' ')}"/>`;
+  points.forEach((p, i) => { svg += `<circle data-i="${i}" cx="${x(p.t)}" cy="${y(p.value)}" r="6" fill="var(--blue-light)" style="cursor:default"/>`; });
+  svg += `<text class="axis" x="${padL}" y="${H - 8}">${esc(fmt.dateShort(t0))}</text><text class="axis" x="${W - 12}" y="${H - 8}" text-anchor="end">${esc(fmt.dateShort(points[points.length - 1].t))}</text>`;
+  svg += '</svg>';
+  el.innerHTML = svg;
+  el.addEventListener('mousemove', (e) => {
+    const i = e.target.dataset?.i;
+    if (i == null) { hideTip(); return; }
+    showTip(e.clientX, e.clientY, points[+i].tip);
+  });
+  el.addEventListener('mouseleave', hideTip);
+  onLeave(hideTip);
+}
+
+function viewFuel() {
+  const p = page();
+  const render = () => {
+    cleanup();
+    p.innerHTML = '';
+    p.appendChild(head('Verbruik', carLine(), yearChips(render)));
+    const all = DATA.fuel || [];
+    if (!all.length) {
+      p.insertAdjacentHTML('beforeend', `<div class="panel empty">Nog geen tankbeurten. Vul ze in de app in onder <b>Verbruik</b>; na de volgende update staan ze hier.</div>`);
+      return;
+    }
+    const inYear = (t) => ui.year === 'all' || new Date(t).getFullYear() === ui.year;
+    const s = fuelSummary(all, DATA.trips);
+    const fills = s.sorted.filter((f) => inYear(f.time));
+    const intervals = s.intervals.filter((i) => inYear(i.endTime));
+    const avg = avgOf(intervals);
+    const euros = fills.reduce((a, f) => a + f.euros, 0);
+    const liters = fills.reduce((a, f) => a + f.liters, 0);
+    const avgPrice = liters > 0 ? euros / liters : null;
+    const allAvg = avgOf(s.intervals);
+    const perKm = allAvg != null && s.lastPrice != null ? (allAvg / 100) * s.lastPrice : null;
+    const official = DATA.car?.consumptionL100;
+
+    p.insertAdjacentHTML('beforeend', `<div class="grid g4">
+      ${stat('Verbruik', avg != null ? fmt.num(avg, 1) : '–', avg != null ? 'l/100 km' : '', intervals.length
+        ? `over ${fmt.num(intervals.reduce((a, i) => a + i.km, 0))} km · ${intervals.length} ${intervals.length === 1 ? 'tank' : 'tanks'}` : 'na de volgende volle tank')}
+      ${stat('Literprijs', s.lastPrice != null ? `€ ${fmt.num(s.lastPrice, 3)}` : '–', '', avgPrice != null ? `gemiddeld € ${fmt.num(avgPrice, 3)}` : '')}
+      ${stat('Per km', perKm != null ? fmt.num(perKm * 100, 1) : '–', perKm != null ? 'ct' : '', perKm != null ? 'bij je gemiddelde verbruik en de laatste prijs' : '')}
+      ${stat('Getankt', `€ ${fmt.num(euros)}`, '', `${fmt.num(liters)} l · ${fills.length} ${fills.length === 1 ? 'keer' : 'keer'}`)}
+    </div>`);
+
+    // Consumption per tank
+    const per = document.createElement('section');
+    per.className = 'panel';
+    per.innerHTML = `<div class="panel-head"><h2 class="label">Verbruik per tank</h2><div class="spacer"></div>
+      ${avg != null ? `<span class="legend"><span><i style="background:var(--blue-light)"></i>gemiddeld ${fmt.num(avg, 1)} l/100 km${official ? ` · opgave ${fmt.num(official, 1)}` : ''}</span></span>` : ''}</div>
+      <div class="chart" id="fuel-tanks"></div>`;
+    p.appendChild(per);
+    if (intervals.length) {
+      svgBars($('#fuel-tanks', per), intervals.map((i) => ({
+        value: i.l100,
+        label: fmt.dateShort(i.endTime).replace(/ \d{4}$/, ''),
+        tip: `<b>${esc(fmt.dateShort(i.endTime))}</b> · ${fmt.num(i.l100, 1)} l/100 km · ${fmt.num(i.km)} km · ${fmt.num(i.liters, 1)} l`,
+      })), { avg, fmtAxis: (v) => fmt.num(v, v < 10 ? 1 : 0), labelEvery: Math.ceil(intervals.length / 12) });
+    } else {
+      $('#fuel-tanks', per).innerHTML = '<p class="muted">Je verbruik verschijnt na twee volle tanks met ritten ertussen.</p>';
+    }
+
+    // Price and spending
+    const row = document.createElement('div');
+    row.className = 'grid g2';
+    row.innerHTML = `<section class="panel"><h2 class="label">Literprijs</h2><div class="chart" id="fuel-price"></div></section>
+      <section class="panel"><h2 class="label">Uitgaven per maand</h2><div class="chart" id="fuel-months"></div></section>`;
+    p.appendChild(row);
+    const priced = fills.filter((f) => f.liters > 0);
+    if (priced.length >= 2) {
+      svgLine($('#fuel-price', row), priced.map((f) => ({
+        t: f.time, value: f.euros / f.liters,
+        tip: `<b>€ ${fmt.num(f.euros / f.liters, 3)}</b> · ${esc(fmt.dateShort(f.time))}${f.station ? ` · ${esc(f.station)}` : ''}`,
+      })), { fmtAxis: (v) => fmt.num(v, 2), width: 560 });
+    } else {
+      $('#fuel-price', row).innerHTML = '<p class="muted">Na twee tankbeurten zie je hier hoe de prijs loopt.</p>';
+    }
+    const first = new Date(fills[0]?.time ?? Date.now()), last = new Date(fills[fills.length - 1]?.time ?? Date.now());
+    const start = ui.year === 'all' ? [first.getFullYear(), first.getMonth()] : [ui.year, 0];
+    const end = ui.year === 'all' ? [last.getFullYear(), last.getMonth()] : [ui.year, 11];
+    const months = [];
+    for (let y = start[0], m = start[1]; y < end[0] || (y === end[0] && m <= end[1]); m === 11 ? (y++, m = 0) : m++) {
+      const fs = fills.filter((f) => { const d = new Date(f.time); return d.getFullYear() === y && d.getMonth() === m; });
+      const eur = fs.reduce((a, f) => a + f.euros, 0);
+      months.push({ value: eur, label: fmt.monthShort(m), tip: `<b>${esc(cap(fmt.month(y, m)))}</b> · € ${fmt.num(eur, 2)} · ${fs.length}× getankt` });
+    }
+    svgBars($('#fuel-months', row), months, { fmtAxis: (v) => `€ ${fmt.num(v)}`, labelEvery: Math.ceil(months.length / 8), width: 560 });
+
+    // All fill-ups
+    const byEnd = new Map(s.intervals.map((i) => [i.endTime, i]));
+    const list = [...fills].reverse();
+    const table = document.createElement('section');
+    table.className = 'panel';
+    table.innerHTML = `<div class="panel-head"><h2 class="label">Tankbeurten</h2></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Datum</th><th>Station</th><th class="num">Liters</th><th class="num">Bedrag</th><th class="num">Prijs per liter</th><th class="num">Verbruik</th><th>Tank</th></tr></thead>
+        <tbody>${list.map((f) => {
+          const iv = byEnd.get(f.time);
+          const trip = f.tripStart != null ? DATA.byStart.get(f.tripStart) : null;
+          return `<tr${trip ? ` data-id="${trip.id}"` : ' style="cursor:default"'}>
+            <td><div>${esc(cap(fmt.date(f.time)))}</div><div class="muted">${fmt.time(f.time)}</div></td>
+            <td class="route">${trip ? `<a href="#/rit/${trip.id}">${esc(f.station || trip.label || 'Rit')}</a>` : esc(f.station || '–')}</td>
+            <td class="num">${fmt.num(f.liters, 2)} <span class="muted">l</span></td>
+            <td class="num">€ ${fmt.num(f.euros, 2)}</td>
+            <td class="num">€ ${fmt.num(f.liters > 0 ? f.euros / f.liters : 0, 3)}</td>
+            <td class="num">${iv ? `${fmt.num(iv.l100, 1)} <span class="muted">l/100 km</span>` : '<span class="muted">–</span>'}</td>
+            <td>${f.full === false ? '<span class="muted">deels</span>' : 'vol'}</td>
+          </tr>`;
+        }).join('') || `<tr><td colspan="7" class="empty">Geen tankbeurten in ${ui.year}.</td></tr>`}</tbody>
+      </table></div>`;
+    p.appendChild(table);
+    bindRows($('tbody', table));
   };
   render();
 }
