@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TripTrack · Ritten</title>
+<meta name="description" content="Je TripTrack-ritten op een groot scherm: overzicht, rittentabel, kaarten en records.">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%232D7FF9' stroke-width='5'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<a class="skip" href="#main">Naar de inhoud</a>
+
+<aside class="side">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="12" fill="none" stroke="currentColor" stroke-width="4.5"/><circle cx="16" cy="16" r="3.5" fill="currentColor"/></svg>
+    <span class="brand-word">TRIPTRACK</span>
+  </div>
+  <nav class="nav" aria-label="Onderdelen">
+    <a href="#/overzicht" data-view="overzicht">Overzicht</a>
+    <a href="#/ritten" data-view="ritten">Ritten</a>
+    <a href="#/kaart" data-view="kaart">Kaart</a>
+    <a href="#/records" data-view="records">Records</a>
+  </nav>
+  <div class="source" id="source" hidden>
+    <div class="source-name" id="source-name"></div>
+    <div class="source-meta" id="source-meta"></div>
+    <div class="source-actions">
+      <button type="button" class="link" id="btn-other">Ander bestand</button>
+      <button type="button" class="link" id="btn-forget">Vergeten</button>
+    </div>
+  </div>
+</aside>
+
+<main id="main" tabindex="-1">
+  <section class="drop" id="drop" hidden>
+    <div class="drop-box" id="drop-box">
+      <h1 class="display">Je ritten op een groot scherm</h1>
+      <p class="lead">Sleep een TripTrack-back-up (<code>.ttbackup</code>) hierheen. Die maak je in de app via Instellingen → Back-up.</p>
+      <button type="button" class="btn" id="btn-pick">Back-up kiezen</button>
+      <p class="fine">Het bestand wordt alleen in deze browser gelezen en bewaard. Er gaat niets naar een server.</p>
+      <p class="error" id="drop-error" role="alert" hidden></p>
+      <div class="progress" id="progress" hidden><div class="progress-bar" id="progress-bar"></div></div>
+    </div>
+  </section>
+  <section class="drop" id="unlock" hidden>
+    <form class="drop-box" id="unlock-form">
+      <h1 class="display">Ritten ontgrendelen</h1>
+      <p class="lead">De ritten van <b id="unlock-repo"></b> staan versleuteld online. Vul het wachtwoord in dat je in de app hebt gekozen.</p>
+      <label class="field"><span>Wachtwoord</span><input type="password" id="unlock-pw" autocomplete="current-password" required></label>
+      <label class="check"><input type="checkbox" id="unlock-remember" checked> Onthouden op deze computer</label>
+      <button class="btn" type="submit" id="unlock-btn">Openen</button>
+      <p class="error" id="unlock-error" role="alert" hidden></p>
+      <p class="fine">Je browser ontsleutelt de gegevens zelf; het wachtwoord gaat nergens heen.<br><button type="button" class="link" id="unlock-file">Liever een back-up-bestand openen</button></p>
+    </form>
+  </section>
+  <div id="view"></div>
+</main>
+
+<input type="file" id="file" accept=".ttbackup,.gz,application/gzip" hidden>
+<div class="tip" id="tip" role="status" hidden></div>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
