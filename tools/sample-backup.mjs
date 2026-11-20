@@ -50,6 +50,28 @@ function hav(a, b) {
   return 2 * R * Math.asin(Math.sqrt(x));
 }
 
+/** Same as FuelModel.components in the app: Σ v²·ds and valley→peak accelerations (> 0.8 m/s). */
+function energyParts(points) {
+  const n = points.length;
+  const raw = points.map((p) => p[4]);
+  const med = raw.map((_, i) => raw.slice(Math.max(0, i - 2), Math.min(n, i + 3)).sort((a, b) => a - b)[Math.floor(Math.min(5, n) / 2)] ?? raw[i]);
+  const v = med.map((_, i) => { const w = med.slice(Math.max(0, i - 2), Math.min(n, i + 3)); return w.reduce((a, b) => a + b, 0) / w.length; });
+  let aero = 0;
+  for (let i = 1; i < n; i++) {
+    const ds = hav([points[i - 1][1], points[i - 1][2]], [points[i][1], points[i][2]]);
+    const vm = (v[i] + v[i - 1]) / 2;
+    aero += vm * vm * ds;
+  }
+  let kinetic = 0, low = v[0], high = v[0], rising = false;
+  for (let i = 1; i < n; i++) {
+    const x = v[i];
+    if (rising) { if (x > high) high = x; else if (high - x > 0.8) { kinetic += (high * high - low * low) / 2; rising = false; low = x; } }
+    else { if (x < low) low = x; else if (x - low > 0.8) { rising = true; high = x; } }
+  }
+  if (rising) kinetic += (high * high - low * low) / 2;
+  return { fuelAero: aero, fuelKinetic: kinetic };
+}
+
 function trip(startMs, from, to) {
   const line = path(from, to);
   const cum = [0];
@@ -106,7 +128,7 @@ function trip(startMs, from, to) {
     hardCornerCount: Math.round(rnd() * 3), maxLateralAccel: 3 + rnd() * 2,
     gPeakAccel: maxA / 9.81, gPeakBrake: maxD / 9.81, gPeakCorner: 0.2 + rnd() * 0.3, newRoadKm: rnd() < 0.3 ? +(rnd() * 12).toFixed(1) : 0,
     startLat: points[0][1], startLon: points[0][2], endLat: points[secs - 1][1], endLon: points[secs - 1][2],
-    startPlace: from[0], endPlace: to[0], points,
+    startPlace: from[0], endPlace: to[0], points, ...energyParts(points),
   };
 }
 

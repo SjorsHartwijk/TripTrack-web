@@ -422,6 +422,7 @@ function showData() {
   els.sourceMeta.textContent = DATA.remote
     ? `${fmt.num(n)} ${n === 1 ? 'rit' : 'ritten'} · bijgewerkt ${fmt.dateShort(when)} ${fmt.time(when)}`
     : `${fmt.num(n)} ${n === 1 ? 'rit' : 'ritten'} · gemaakt ${fmt.dateShort(when)}`;
+  fuelEstimates(); // sets t.estL100 for the trips table
   els.btnOther.textContent = DATA.remote ? 'Vernieuwen' : 'Ander bestand';
   els.btnForget.textContent = DATA.remote ? 'Vergrendelen' : 'Vergeten';
   route();
@@ -548,6 +549,7 @@ function tripRow(t) {
     <td class="num">${fmt.clock(t.totalTimeS)}</td>
     <td class="num">${fmt.kmh(t.avgMovingKmh)} <span class="muted">km/u</span></td>
     <td class="num">${fmt.kmh(t.maxSpeedKmh)} <span class="muted">km/u</span></td>
+    <td class="num">${t.estL100 != null ? `${fmt.num(t.estL100, 1)} <span class="muted">l/100</span>` : '<span class="muted">–</span>'}</td>
     <td class="num">${t.score != null ? `<span class="pill">${t.score}</span>` : '<span class="muted">–</span>'}</td>
     <td>${t.weather ? `${esc(t.weather)}${t.temperatureC != null ? ` <span class="muted">${fmt.num(t.temperatureC)}°</span>` : ''}` : '<span class="muted">–</span>'}</td>
   </tr>`;
@@ -711,6 +713,7 @@ const COLS = [
   { key: 'totalTimeS', label: 'Tijd', num: true },
   { key: 'avgMovingKmh', label: 'Gem.', num: true },
   { key: 'maxSpeedKmh', label: 'Top', num: true },
+  { key: 'estL100', label: 'Verbruik', num: true },
   { key: 'score', label: 'Rijstijl', num: true },
   { key: 'temperatureC', label: 'Weer' },
 ];
@@ -872,6 +875,14 @@ function viewTrip(arg) {
     ${kv('Langste non-stop', `${fmt.km(t.longestNonStopM)} km · ${fmt.dur(t.longestNonStopS)}`)}
     ${kv('Stijging / daling', `${fmt.num(t.elevGainM)} / ${fmt.num(t.elevLossM)} m`)}
     ${kv('Hard optrekken / remmen', `${t.hardAccelCount}× / ${t.hardBrakeCount}×`)}
+    ${(() => {
+      const e = fuelEstimates().byTrip.get(t.id);
+      if (!e) return '';
+      const avg = fuelEstimates().overall;
+      const diff = avg ? Math.round((e.l100 / avg - 1) * 100) : 0;
+      return kv('Verbruik (berekend)', `≈ ${fmt.num(e.l100, 1)} l/100 km · ${fmt.num(e.liters, 2)} l${e.euros != null ? ` · € ${fmt.num(e.euros, 2)}` : ''}`)
+        + (avg ? kv('Tegenover je gemiddelde', diff <= -3 ? `${-diff}% zuiniger` : diff >= 3 ? `${diff}% meer` : 'gemiddeld') : '');
+    })()}
     ${kv('Nieuwe wegen', t.newRoadKm != null ? `${fmt.km(t.newRoadKm * 1000)} km` : null)}
     ${kv('Te hard', t.pctOverLimit != null ? `${fmt.num(t.pctOverLimit, 1)}% van de afstand` : null)}
     ${recs.length ? kv('Records', recs.map((k) => `<span class="badge">${esc(recordDef(k)?.title ?? k)}</span>`).join(' ')) : ''}
@@ -1085,6 +1096,167 @@ function viewMap() {
   render();
 }
 
+// ---------------------------------------------------------------- fuel per trip (ported from FuelModel.kt)
+
+/** Modelled litres before calibration: rolling, air drag, accelerating, climbing, idling, cold start. */
+function rawLiters(t, car) {
+  if (t.fuelAero == null || t.fuelKinetic == null || t.distanceM < 10) return null;
+  const G = 9.81;
+  const wheelJ = car.mass * (0.011 * G * t.distanceM + t.fuelKinetic + G * (t.elevGainM || 0)) + 0.5 * 1.2 * 0.65 * t.fuelAero;
+  const [eff, lhv] = car.diesel ? [0.32, 35.8e6] : [0.27, 32.0e6];
+  const idleS = Math.max(0, (t.totalTimeS || 0) - (t.movingTimeS || 0));
+  const temp = t.temperatureC ?? 12;
+  const coldStart = 0.06 * (1 + Math.max(0, (15 - temp) / 15));
+  return wheelJ / (eff * lhv) + (idleS * 0.6) / 3600 + coldStart;
+}
+
+/** Calibrated litres, l/100 km and euros per trip id (cached per loaded data). */
+function fuelEstimates() {
+  if (DATA.est) return DATA.est;
+  const c = DATA.car || {};
+  const car = {
+    mass: c.massReady ?? (c.massEmpty != null ? c.massEmpty + 100 : 1300),
+    diesel: /diesel/i.test(c.fuel || ''),
+    official: c.consumptionL100 ?? null,
+  };
+  const trips = DATA.trips;
+  const raw = new Map();
+  for (const t of trips) { const r = rawLiters(t, car); if (r != null) raw.set(t.id, r); }
+  const est = { k: 1, provisional: true, byTrip: new Map(), overall: null };
+  DATA.est = est;
+  if (!raw.size) return est;
+  const rawKm = trips.filter((t) => raw.has(t.id)).reduce((s, t) => s + t.distanceM / 1000, 0);
+  const rawPerKm = [...raw.values()].reduce((a, b) => a + b, 0) / Math.max(rawKm, 1e-9);
+  const rawOf = (t) => raw.get(t.id) ?? (t.distanceM / 1000) * rawPerKm;
+
+  const fills = [...(DATA.fuel || [])].sort((a, b) => a.time - b.time);
+  let measured = 0, modelled = 0, lastFull = null, liters = 0;
+  for (const f of fills) {
+    liters += f.liters;
+    if (f.full === false) continue;
+    if (lastFull) {
+      const inTank = trips.filter((t) => { const e = t.endTime ?? t.startTime; return e > lastFull.time && e <= f.time; });
+      if (inTank.reduce((s, t) => s + t.distanceM, 0) / 1000 >= 30) {
+        measured += liters;
+        modelled += inTank.reduce((s, t) => s + rawOf(t), 0);
+      }
+    }
+    lastFull = f;
+    liters = 0;
+  }
+  const clamp = (v) => Math.min(2.5, Math.max(0.4, v));
+  if (modelled > 0) { est.k = clamp(measured / modelled); est.provisional = false; }
+  else if (car.official != null) est.k = clamp((car.official * 1.15) / (([...raw.values()].reduce((a, b) => a + b, 0) / rawKm) * 100));
+
+  const priced = fills.filter((f) => f.liters > 0);
+  let L = 0, KM = 0;
+  for (const t of trips) {
+    const r = raw.get(t.id);
+    const km = t.distanceM / 1000;
+    if (r == null || km < 1) continue;
+    const l = r * est.k;
+    const end = t.endTime ?? t.startTime;
+    const p = [...priced].reverse().find((f) => f.time <= end) ?? priced[0];
+    const e = { liters: l, l100: (l / km) * 100, euros: p ? (p.euros / p.liters) * l : null, km };
+    est.byTrip.set(t.id, e);
+    t.estL100 = e.l100;
+    L += l; KM += km;
+  }
+  est.overall = KM > 0.5 ? (L / KM) * 100 : null;
+  return est;
+}
+
+/** l/100 km over a set of trips (litres-weighted). */
+function l100Of(trips) {
+  const est = fuelEstimates();
+  let l = 0, km = 0;
+  for (const t of trips) { const e = est.byTrip.get(t.id); if (e) { l += e.liters; km += e.km; } }
+  return km > 0.5 ? (l / km) * 100 : null;
+}
+
+/** Recurring routes: start and end both within 600 m, at least three trips (as in the app). */
+function routeGroups(trips) {
+  const near = (a1, o1, a2, o2) => a1 != null && a2 != null && haversine(a1, o1, a2, o2) <= 600;
+  const groups = [];
+  for (const t of [...trips].filter((t) => t.startLat != null && t.endLat != null).sort((a, b) => a.startTime - b.startTime)) {
+    const g = groups.find((g) => near(g[0].startLat, g[0].startLon, t.startLat, t.startLon) && near(g[0].endLat, g[0].endLon, t.endLat, t.endLon));
+    if (g) g.push(t); else groups.push([t]);
+  }
+  return groups.filter((g) => g.length >= 3).sort((a, b) => b.length - a.length);
+}
+
+const TRIP_KINDS = [
+  ['Kort (< 5 km)', (t) => t.distanceM < 5000],
+  ['Stad', (t) => t.distanceM >= 5000 && t.avgMovingKmh < 45],
+  ['Gemengd', (t) => t.distanceM >= 5000 && t.avgMovingKmh >= 45 && t.avgMovingKmh <= 75],
+  ['Snelweg', (t) => t.distanceM >= 5000 && t.avgMovingKmh > 75],
+];
+
+/** Panels with fuel per trip, added up per month, kind of trip and route; most and least economical trips. */
+function fuelTripPanels(p, trips) {
+  const est = fuelEstimates();
+  if (!est.byTrip.size) return;
+  const note = est.provisional
+    ? 'Voorlopig: berekend uit je rijstijl en het opgegeven verbruik. Na twee volle tanks ijkt TripTrack op wat je echt tankt.'
+    : 'Per rit berekend uit snelheid, optrekken, stilstaan en hoogte, en geijkt op je tankbeurten.';
+
+  // Per month
+  const months = [];
+  const ts = trips.length ? trips : DATA.trips;
+  const first = new Date(Math.min(...ts.map((t) => t.startTime))), last = new Date(Math.max(...ts.map((t) => t.startTime)));
+  const start = ui.year === 'all' ? [first.getFullYear(), first.getMonth()] : [ui.year, 0];
+  const end = ui.year === 'all' ? [last.getFullYear(), last.getMonth()] : [ui.year, 11];
+  for (let y = start[0], m = start[1]; y < end[0] || (y === end[0] && m <= end[1]); m === 11 ? (y++, m = 0) : m++) {
+    const mt = trips.filter((t) => t.year === y && t.month === m);
+    const v = l100Of(mt);
+    months.push({ value: v ?? 0, label: fmt.monthShort(m), tip: `<b>${esc(cap(fmt.month(y, m)))}</b> · ${v != null ? `${fmt.num(v, 1)} l/100 km` : 'geen ritten'} · ${mt.length} ritten` });
+  }
+  const periodAvg = l100Of(trips);
+  const mp = document.createElement('section');
+  mp.className = 'panel';
+  mp.innerHTML = `<div class="panel-head"><h2 class="label">Verbruik per maand, per rit berekend</h2><div class="spacer"></div>
+    ${periodAvg != null ? `<span class="legend"><span><i style="background:var(--blue-light)"></i>gemiddeld ${fmt.num(periodAvg, 1)} l/100 km</span></span>` : ''}</div>
+    <div class="chart" id="fuel-est-months"></div><p class="muted" style="font-size:13px;margin:10px 0 0">${note}</p>`;
+  p.appendChild(mp);
+  svgBars($('#fuel-est-months', mp), months, { avg: periodAvg, fmtAxis: (v) => fmt.num(v, v < 10 ? 1 : 0), labelEvery: Math.ceil(months.length / 12) });
+
+  // Kind of trip + routes
+  const kinds = TRIP_KINDS.map(([label, test]) => {
+    const g = trips.filter(test);
+    return [label, l100Of(g), g.reduce((s, t) => s + t.distanceM, 0) / 1000];
+  }).filter((r) => r[1] != null);
+  const totalKm = kinds.reduce((s, r) => s + r[2], 0) || 1;
+  const maxK = Math.max(...kinds.map((r) => r[1]), 1);
+  const groups = routeGroups(trips).slice(0, 5);
+  const row = document.createElement('div');
+  row.className = 'grid g2';
+  row.innerHTML = `<section class="panel"><h2 class="label">Soort rit</h2>
+      ${kinds.map(([label, v, km]) => `<div class="hbar"><span>${esc(label)}<br><span class="muted" style="font-size:11px">${fmt.num((km / totalKm) * 100)}% van je km</span></span>
+        <div class="track"><div class="fill" style="width:${(v / maxK) * 100}%"></div></div><span class="n" style="color:var(--text);font-weight:600">${fmt.num(v, 1)} l</span></div>`).join('')}
+      <p class="muted" style="font-size:12px;margin:8px 0 0">l/100 km; gemiddelde snelheid in beweging: stad &lt; 45, snelweg &gt; 75 km/u.</p></section>
+    <section class="panel"><h2 class="label">Vaste ritten</h2>
+      ${groups.length ? groups.map((g) => {
+        const v = l100Of(g);
+        const eur = g.map((t) => est.byTrip.get(t.id)?.euros).filter((x) => x != null);
+        const best = g.filter((t) => est.byTrip.has(t.id)).sort((a, b) => est.byTrip.get(a.id).l100 - est.byTrip.get(b.id).l100)[0];
+        return `<div class="kv"><a class="k" href="#/rit/${best?.id ?? g[0].id}" style="color:var(--text)">${esc(g[0].label ?? 'Vaste rit')}<br><span class="muted" style="font-size:12px">${g.length}× · zuinigste ${best ? fmt.num(est.byTrip.get(best.id).l100, 1) : '–'} l/100 km</span></a>
+          <span class="v">${v != null ? `${fmt.num(v, 1)} l/100 km` : '–'}${eur.length ? `<br><span class="muted" style="font-size:12px;font-weight:400">€ ${fmt.num(eur.reduce((a, b) => a + b, 0) / eur.length, 2)} per rit</span>` : ''}</span></div>`;
+      }).join('') : '<p class="muted">Nog geen route die je drie keer of vaker reed.</p>'}</section>`;
+  p.appendChild(row);
+
+  // Most and least economical
+  const ranked = trips.filter((t) => t.distanceM >= 5000 && est.byTrip.has(t.id)).sort((a, b) => est.byTrip.get(a.id).l100 - est.byTrip.get(b.id).l100);
+  if (ranked.length >= 4) {
+    const list = (arr) => arr.map((t) => `<div class="kv"><a class="k" href="#/rit/${t.id}" style="color:var(--text)">${esc(t.label ?? 'Rit')}<br>
+      <span class="muted" style="font-size:12px">${esc(fmt.dateShort(t.startTime))} · ${fmt.km(t.distanceM)} km · gem. ${fmt.kmh(t.avgMovingKmh)} km/u</span></a>
+      <span class="v">${fmt.num(est.byTrip.get(t.id).l100, 1)} l/100 km</span></div>`).join('');
+    p.insertAdjacentHTML('beforeend', `<div class="grid g2">
+      <section class="panel"><h2 class="label">Zuinigste ritten</h2>${list(ranked.slice(0, 5))}</section>
+      <section class="panel"><h2 class="label">Minst zuinige ritten</h2>${list(ranked.slice(-5).reverse())}</section>
+    </div>`);
+  }
+}
+
 // ---------------------------------------------------------------- fuel (ported from FuelStats.kt)
 
 /** Full-to-full consumption: liters of a full tank (plus partial fills since) over the km since the previous full tank. */
@@ -1111,6 +1283,18 @@ const avgOf = (intervals) => {
   const km = intervals.reduce((s, i) => s + i.km, 0);
   return km > 0 ? (intervals.reduce((s, i) => s + i.liters, 0) / km) * 100 : null;
 };
+
+/** Stations by visits (then litres), as in the app; fill-ups without a station are left out. */
+function stationsOf(fills) {
+  const m = new Map();
+  for (const f of fills) {
+    if (!f.station) continue;
+    const s = m.get(f.station) ?? { name: f.station, visits: 0, liters: 0, euros: 0 };
+    s.visits++; s.liters += f.liters; s.euros += f.euros;
+    m.set(f.station, s);
+  }
+  return [...m.values()].sort((a, b) => b.visits - a.visits || b.liters - a.liters);
+}
 
 /** Generic SVG bar chart with hover tooltips; bars: [{ value, label, tip }]. */
 function svgBars(el, bars, { avg = null, fmtAxis = (v) => fmt.num(v), labelEvery = 1, onClick = null, width = 1000 } = {}) {
@@ -1184,6 +1368,7 @@ function viewFuel() {
     const all = DATA.fuel || [];
     if (!all.length) {
       p.insertAdjacentHTML('beforeend', `<div class="panel empty">Nog geen tankbeurten. Vul ze in de app in onder <b>Verbruik</b>; na de volgende update staan ze hier.</div>`);
+      fuelTripPanels(p, DATA.trips.filter((t) => ui.year === 'all' || t.year === ui.year));
       return;
     }
     const inYear = (t) => ui.year === 'all' || new Date(t).getFullYear() === ui.year;
@@ -1221,6 +1406,22 @@ function viewFuel() {
       })), { avg, fmtAxis: (v) => fmt.num(v, v < 10 ? 1 : 0), labelEvery: Math.ceil(intervals.length / 12) });
     } else {
       $('#fuel-tanks', per).innerHTML = '<p class="muted">Je verbruik verschijnt na twee volle tanks met ritten ertussen.</p>';
+    }
+
+    fuelTripPanels(p, DATA.trips.filter((t) => ui.year === 'all' || t.year === ui.year));
+
+    // Stations
+    const stations = stationsOf(fills);
+    if (stations.length) {
+      const regulars = stations.filter((st) => st.visits >= 2);
+      const cheap = regulars.length >= 2 ? regulars.reduce((a, b) => (b.euros / b.liters < a.euros / a.liters ? b : a)) : null;
+      p.insertAdjacentHTML('beforeend', `<section class="panel"><div class="panel-head"><h2 class="label">Tankstations</h2><div class="spacer"></div>
+        ${cheap ? `<span class="hint">Goedkoopst van je vaste stations: <b style="color:var(--text)">${esc(cheap.name)}</b></span>` : ''}</div>
+        <div class="table-wrap"><table><thead><tr><th>Station</th><th class="num">Keer</th><th class="num">Liters</th><th class="num">Bedrag</th><th class="num">Gem. prijs per liter</th></tr></thead>
+        <tbody>${stations.slice(0, 8).map((st, i) => `<tr style="cursor:default">
+          <td class="route">${esc(st.name)}${i === 0 && st.visits > 1 ? ' <span class="badge">FAVORIET</span>' : ''}</td>
+          <td class="num">${st.visits}×</td><td class="num">${fmt.num(st.liters)} <span class="muted">l</span></td>
+          <td class="num">€ ${fmt.num(st.euros, 0)}</td><td class="num">€ ${fmt.num(st.euros / st.liters, 3)}</td></tr>`).join('')}</tbody></table></div></section>`);
     }
 
     // Price and spending
@@ -1293,6 +1494,22 @@ function viewRecords() {
     return trip ? `<a class="panel record" href="#/rit/${trip.id}">${inner}</a>` : `<div class="panel record">${inner}</div>`;
   }).join('');
   p.insertAdjacentHTML('beforeend', cards ? `<div class="grid g3">${cards}</div>` : '<div class="panel empty">Nog geen records in deze back-up.</div>');
+
+  // Fuel: favourite station and the most economical trip (calculated per trip).
+  const fav = stationsOf(DATA.fuel || [])[0];
+  const est = fuelEstimates();
+  const thrifty = DATA.trips.filter((t) => t.distanceM >= 5000 && est.byTrip.has(t.id))
+    .sort((a, b) => est.byTrip.get(a.id).l100 - est.byTrip.get(b.id).l100)[0];
+  if (fav || thrifty) {
+    p.insertAdjacentHTML('beforeend', `<div class="grid g2">
+      ${fav ? `<div class="panel record"><div class="label">Favoriete tankstation</div>
+        <div class="value" style="font-size:24px">${esc(fav.name)}</div>
+        <div class="when">${fav.visits}× getankt · ${fmt.num(fav.liters)} l · gem. € ${fmt.num(fav.euros / fav.liters, 3)} per liter</div></div>` : ''}
+      ${thrifty ? `<a class="panel record" href="#/rit/${thrifty.id}"><div class="label">Zuinigste rit${est.provisional ? ' (voorlopig)' : ''}</div>
+        <div class="value">${fmt.num(est.byTrip.get(thrifty.id).l100, 1)}<span class="unit">l/100 km</span></div>
+        <div class="when">${esc(cap(fmt.date(thrifty.startTime)))} · ${esc(thrifty.label ?? 'Rit')} · ${fmt.km(thrifty.distanceM)} km</div></a>` : ''}
+    </div>`);
+  }
 
   const top5 = (title, sorter, val) => {
     const list = [...DATA.trips].filter((t) => val(t) != null).sort(sorter).slice(0, 5);
