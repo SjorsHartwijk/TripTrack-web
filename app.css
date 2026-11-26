@@ -56,7 +56,7 @@ code { font-size: .92em; color: var(--text); }
   display: flex; flex-direction: column; gap: 28px; background: var(--black); border-right: 1px solid var(--surface2); z-index: 20;
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 0 10px; color: var(--blue); }
-.brand-mark { width: 26px; height: 26px; }
+.brand-mark { width: 34px; height: 34px; }
 .brand-word { font: italic 700 24px Futura, Inter, sans-serif; color: var(--text); letter-spacing: .01em; }
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav a {
