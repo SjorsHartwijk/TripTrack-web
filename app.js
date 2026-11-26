@@ -108,13 +108,9 @@ const ROADS = [
 
 /** Same scale as the app's route colours. */
 function speedColor(v) {
-  if (v < 30) return '#1E3A8A';
-  if (v < 50) return '#1D4ED8';
-  if (v < 80) return '#2D7FF9';
-  if (v < 100) return '#38BDF8';
-  if (v < 120) return '#7DD3FC';
-  return '#E0F2FE';
+  return neonSpeedColor(v);
 }
+
 
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 6371000, toR = Math.PI / 180;
@@ -779,36 +775,62 @@ function viewTrips() {
 
 // ---------------------------------------------------------------- map helpers
 
-function makeMap(el, opts = {}) {
-  // The scroll wheel scrolls the page; it zooms the map only after a click on it.
-  const map = L.map(el, { preferCanvas: true, zoomControl: true, attributionControl: true, scrollWheelZoom: false, ...opts });
-  map.on('click focus', () => map.scrollWheelZoom.enable());
-  map.on('mouseout blur', () => map.scrollWheelZoom.disable());
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19, className: 'dark-tiles', attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-  }).addTo(map);
-  map.attributionControl.setPrefix(false);
+/** Neon vector map (MapLibre, same style as the app); the wheel zooms only after a click on the map. */
+function makeMap(el) {
+  const map = new maplibregl.Map({
+    container: el, style: neonStyle(), center: [5.3, 52.15], zoom: 7,
+    attributionControl: { compact: true }, dragRotate: false, pitchWithRotate: false,
+  });
+  map.touchZoomRotate.disableRotation();
+  map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-left');
+  map.scrollZoom.disable();
+  map.on('click', () => map.scrollZoom.enable());
+  el.addEventListener('mouseleave', () => map.scrollZoom.disable());
   onLeave(() => map.remove());
   return map;
 }
 
+/** Runs fn once the style is loaded. */
+const whenLoaded = (map, fn) => (map.loaded() ? fn() : map.once('load', fn));
+
+const lineFeature = (coords, props = {}) => ({ type: 'Feature', properties: props, geometry: { type: 'LineString', coordinates: coords } });
+const pointFeature = (c, props = {}) => ({ type: 'Feature', properties: props, geometry: { type: 'Point', coordinates: c } });
+const collection = (features) => ({ type: 'FeatureCollection', features });
+
+function fitCoords(map, coords, padding = 30) {
+  if (!coords.length) return;
+  const b = new maplibregl.LngLatBounds(coords[0], coords[0]);
+  coords.forEach((c) => b.extend(c));
+  map.fitBounds(b, { padding, duration: 0, maxZoom: 17 });
+}
+
+/** The route coloured by speed (cyan, yellow, orange), tunnel stretches dashed, start and finish marked. */
 function drawRoute(map, P) {
-  const layer = L.layerGroup().addTo(map);
-  if (P.n < 2) return layer;
-  let cur = [[P.lat[0], P.lon[0]]], color = speedColor(P.v[0]), est = P.est[0];
-  const flush = () => {
-    if (cur.length > 1) L.polyline(cur, { color, weight: 5, opacity: est ? 0.6 : 0.95, dashArray: est ? '6 8' : null, lineCap: 'round', lineJoin: 'round' }).addTo(layer);
-  };
+  if (P.n < 2) return;
+  const feats = [];
+  let cur = [[P.lon[0], P.lat[0]]], color = neonSpeedColor(P.v[0]), est = P.est[0];
+  const flush = () => { if (cur.length > 1) feats.push(lineFeature(cur, { color, est: !!est })); };
   for (let i = 1; i < P.n; i++) {
-    const c = speedColor(P.v[i]);
+    const c = neonSpeedColor(P.v[i]);
     const e = P.est[i];
-    cur.push([P.lat[i], P.lon[i]]);
-    if (c !== color || e !== est) { flush(); cur = [[P.lat[i], P.lon[i]]]; color = c; est = e; }
+    cur.push([P.lon[i], P.lat[i]]);
+    if (c !== color || e !== est) { flush(); cur = [[P.lon[i], P.lat[i]]]; color = c; est = e; }
   }
   flush();
-  L.circleMarker([P.lat[0], P.lon[0]], { radius: 7, color: '#2D7FF9', weight: 3, fillColor: '#000', fillOpacity: 1 }).bindTooltip('Start', { className: 'tt-label' }).addTo(layer);
-  L.circleMarker([P.lat[P.n - 1], P.lon[P.n - 1]], { radius: 7, color: '#ffffff', weight: 3, fillColor: '#2D7FF9', fillOpacity: 1 }).bindTooltip('Aankomst', { className: 'tt-label' }).addTo(layer);
-  return layer;
+  whenLoaded(map, () => {
+    const round = { 'line-cap': 'round', 'line-join': 'round' };
+    map.addSource('route', { type: 'geojson', data: collection(feats) });
+    map.addLayer({ id: 'route-glow', type: 'line', source: 'route', layout: round, paint: { 'line-color': ['get', 'color'], 'line-width': 12, 'line-blur': 6, 'line-opacity': 0.35 } }, 'road-names');
+    map.addLayer({ id: 'route', type: 'line', source: 'route', filter: ['!', ['get', 'est']], layout: round, paint: { 'line-color': ['get', 'color'], 'line-width': 5 } }, 'road-names');
+    map.addLayer({ id: 'route-est', type: 'line', source: 'route', filter: ['get', 'est'], layout: round, paint: { 'line-color': ['get', 'color'], 'line-width': 5, 'line-opacity': 0.8, 'line-dasharray': [0.4, 2] } }, 'road-names');
+    map.addSource('ends', { type: 'geojson', data: collection([
+      pointFeature([P.lon[0], P.lat[0]], { start: true }), pointFeature([P.lon[P.n - 1], P.lat[P.n - 1]], { start: false }),
+    ]) });
+    map.addLayer({ id: 'ends', type: 'circle', source: 'ends', paint: {
+      'circle-radius': 7, 'circle-stroke-width': 3,
+      'circle-color': ['case', ['get', 'start'], '#050B1E', '#FFC83D'], 'circle-stroke-color': ['case', ['get', 'start'], '#33D1FF', '#ffffff'],
+    } });
+  });
 }
 
 // ---------------------------------------------------------------- trip detail
@@ -852,7 +874,11 @@ function viewTrip(arg) {
 
   const grid = document.createElement('div');
   grid.className = 'grid g-detail';
-  grid.innerHTML = `<div class="map" id="trip-map"></div><div class="grid" style="align-content:start"></div>`;
+  // Speed legend: the same colours and limits as the route on the map (NEON in neon-style.js).
+  const speedLegend = [`&lt; ${NEON.speedSlow}`, `${NEON.speedSlow}–${NEON.speedFast}`, `&gt; ${NEON.speedFast} km/u`]
+    .map((label, k) => `<span><i style="background:${NEON.speed[k]}"></i>${label}</span>`).join('');
+  grid.innerHTML = `<div style="min-width:0"><div class="map" id="trip-map"></div><div class="legend" style="margin-top:10px">${speedLegend}</div></div>
+    <div class="grid" style="align-content:start"></div>`;
   p.appendChild(grid);
   const side = grid.children[1];
 
@@ -891,11 +917,11 @@ function viewTrip(arg) {
   const map = makeMap($('#trip-map', grid));
   if (P.n > 1) {
     drawRoute(map, P);
-    map.fitBounds(L.latLngBounds(thin(P, 50)), { padding: [30, 30] });
-  } else {
-    map.setView([52.15, 5.3], 7);
+    fitCoords(map, thin(P, 50).map(([la, lo]) => [lo, la]));
   }
-  const cursor = L.circleMarker([0, 0], { radius: 8, color: '#fff', weight: 3, fillColor: '#2D7FF9', fillOpacity: 1, interactive: false });
+  const cursorEl = document.createElement('div');
+  cursorEl.className = 'map-cursor';
+  const cursor = new maplibregl.Marker({ element: cursorEl });
 
   // Charts over distance
   if (P.n > 1) {
@@ -922,7 +948,7 @@ function viewTrip(arg) {
     const onHover = (i) => {
       charts.forEach((c) => c.setCursor(i));
       if (i == null) { cursor.remove(); return; }
-      cursor.setLatLng([P.lat[i], P.lon[i]]).addTo(map);
+      cursor.setLngLat([P.lon[i], P.lat[i]]).addTo(map);
       const bits = [
         `<span>Afstand <b>${fmt.km(P.d[i])} km</b></span>`,
         `<span>Tijd <b>${fmt.time(P.t[i])}</b></span>`,
@@ -954,7 +980,7 @@ function canvasChart(el, P, draw) {
     g.font = '11px Inter, sans-serif';
     draw(g, W, H, PAD, xOf);
     // x axis: km
-    g.fillStyle = '#8D94A5';
+    g.fillStyle = '#7C95C4';
     g.textAlign = 'center';
     const total = P.d[P.n - 1] / 1000;
     const step = niceStep(total / 8);
@@ -1008,11 +1034,11 @@ function speedChart(el, P) {
       for (let i = 0; i < P.n; i++) if (!Number.isNaN(P.alt[i])) g.lineTo(xOf(P.d[i]), yA(P.alt[i]));
       g.lineTo(xOf(P.d[P.n - 1]), H - PAD.b);
       g.closePath();
-      g.fillStyle = '#1A1E27';
+      g.fillStyle = '#0F1E44';
       g.fill();
     }
     // guide lines
-    g.strokeStyle = '#242833'; g.fillStyle = '#8D94A5'; g.textAlign = 'right'; g.lineWidth = 1;
+    g.strokeStyle = '#1D3670'; g.fillStyle = '#7C95C4'; g.textAlign = 'right'; g.lineWidth = 1;
     for (const v of [50, 80, 100, 130].filter((v) => v < topV)) {
       g.beginPath(); g.moveTo(PAD.l, yV(v)); g.lineTo(W - PAD.r, yV(v)); g.stroke();
       g.fillText(String(v), PAD.l - 8, yV(v) + 4);
@@ -1020,7 +1046,7 @@ function speedChart(el, P) {
     // speed
     g.beginPath();
     for (let i = 0; i < P.n; i++) { const x = xOf(P.d[i]), y = yV(P.v[i]); i ? g.lineTo(x, y) : g.moveTo(x, y); }
-    g.strokeStyle = '#2D7FF9'; g.lineWidth = 1.8; g.lineJoin = 'round';
+    g.strokeStyle = '#33D1FF'; g.lineWidth = 1.8; g.lineJoin = 'round';
     g.stroke();
   });
 }
@@ -1035,7 +1061,7 @@ function gChart(el, P) {
     }
     const top = Math.max(0.4, Math.ceil(m * 1.15 * 10) / 10);
     const y = (v) => PAD.t + plotH * (0.5 - v / (2 * top));
-    g.strokeStyle = '#242833'; g.fillStyle = '#8D94A5'; g.textAlign = 'right'; g.lineWidth = 1;
+    g.strokeStyle = '#1D3670'; g.fillStyle = '#7C95C4'; g.textAlign = 'right'; g.lineWidth = 1;
     for (const v of [-top, -top / 2, 0, top / 2, top]) {
       g.beginPath(); g.moveTo(PAD.l, y(v)); g.lineTo(W - PAD.r, y(v)); g.stroke();
       g.fillText(fmt.num(v, 1), PAD.l - 8, y(v) + 4);
@@ -1051,8 +1077,8 @@ function gChart(el, P) {
       }
       g.strokeStyle = color; g.lineWidth = 1.4; g.stroke();
     };
-    line(P.gLat, '#A9CCFF');
-    line(P.gLong, '#2D7FF9');
+    line(P.gLat, '#9BE9FF');
+    line(P.gLong, '#33D1FF');
   });
 }
 
@@ -1080,18 +1106,35 @@ function viewMap() {
       return;
     }
     const map = makeMap(el);
-    const group = L.featureGroup().addTo(map);
+    // Your trips in yellow, half transparent: roads you drive often light up.
+    const feats = [], all = [];
     for (const t of trips) {
       if (t.pts.n < 2) continue;
-      const line = L.polyline(thin(t.pts), { color: '#2D7FF9', weight: 3, opacity: 0.4, lineCap: 'round', lineJoin: 'round' });
-      line.bindTooltip(`${esc(t.label ?? 'Rit')} · ${esc(fmt.dateShort(t.startTime))} · ${fmt.km(t.distanceM)} km`, { className: 'tt-label', sticky: true });
-      line.on('mouseover', () => { line.setStyle({ color: '#ffffff', weight: 5, opacity: 1 }); line.bringToFront(); });
-      line.on('mouseout', () => line.setStyle({ color: '#2D7FF9', weight: 3, opacity: 0.4 }));
-      line.on('click', () => { location.hash = `#/rit/${t.id}`; });
-      line.addTo(group);
+      const c = thin(t.pts).map(([la, lo]) => [lo, la]);
+      feats.push(lineFeature(c, { id: t.id, tip: `${t.label ?? 'Rit'} · ${fmt.dateShort(t.startTime)} · ${fmt.km(t.distanceM)} km` }));
+      for (let k = 0; k < c.length; k += 10) all.push(c[k]);
     }
-    if (group.getLayers().length) map.fitBounds(group.getBounds(), { padding: [30, 30] });
-    else map.setView([52.15, 5.3], 7);
+    whenLoaded(map, () => {
+      const round = { 'line-cap': 'round', 'line-join': 'round' };
+      map.addSource('trips', { type: 'geojson', data: collection(feats) });
+      map.addLayer({ id: 'trips', type: 'line', source: 'trips', layout: round, paint: { 'line-color': '#FFC83D', 'line-width': 3, 'line-opacity': 0.42 } }, 'road-names');
+      map.addLayer({ id: 'trips-hover', type: 'line', source: 'trips', layout: round, filter: ['==', ['get', 'id'], -1],
+        paint: { 'line-color': '#ffffff', 'line-width': 5 } }, 'road-names');
+      const tip = new maplibregl.Popup({ closeButton: false, closeOnClick: false, className: 'tt-label', offset: 12 });
+      map.on('mousemove', 'trips', (e) => {
+        const f = e.features[0];
+        map.getCanvas().style.cursor = 'pointer';
+        map.setFilter('trips-hover', ['==', ['get', 'id'], f.properties.id]);
+        tip.setLngLat(e.lngLat).setText(f.properties.tip).addTo(map);
+      });
+      map.on('mouseleave', 'trips', () => {
+        map.getCanvas().style.cursor = '';
+        map.setFilter('trips-hover', ['==', ['get', 'id'], -1]);
+        tip.remove();
+      });
+      map.on('click', 'trips', (e) => { location.hash = `#/rit/${e.features[0].properties.id}`; });
+    });
+    if (all.length) fitCoords(map, all);
   };
   render();
 }
@@ -1215,7 +1258,7 @@ function fuelTripPanels(p, trips) {
   const mp = document.createElement('section');
   mp.className = 'panel';
   mp.innerHTML = `<div class="panel-head"><h2 class="label">Verbruik per maand, per rit berekend</h2><div class="spacer"></div>
-    ${periodAvg != null ? `<span class="legend"><span><i style="background:var(--blue-light)"></i>gemiddeld ${fmt.num(periodAvg, 1)} l/100 km</span></span>` : ''}</div>
+    ${periodAvg != null ? `<span class="legend"><span><i style="background:var(--yellow)"></i>gemiddeld ${fmt.num(periodAvg, 1)} l/100 km</span></span>` : ''}</div>
     <div class="chart" id="fuel-est-months"></div><p class="muted" style="font-size:13px;margin:10px 0 0">${note}</p>`;
   p.appendChild(mp);
   svgBars($('#fuel-est-months', mp), months, { avg: periodAvg, fmtAxis: (v) => fmt.num(v, v < 10 ? 1 : 0), labelEvery: Math.ceil(months.length / 12) });
@@ -1315,7 +1358,7 @@ function svgBars(el, bars, { avg = null, fmtAxis = (v) => fmt.num(v), labelEvery
     svg += `<rect data-i="${i}" x="${x}" y="${padT}" width="${bw}" height="${H - padT - padB}" fill="transparent"${onClick ? ' style="cursor:pointer"' : ''}/>`;
     if (i % labelEvery === 0) svg += `<text class="axis" x="${x + bw / 2}" y="${H - padB + 18}" text-anchor="middle">${esc(b.label)}</text>`;
   });
-  if (avg != null) svg += `<line x1="${padL}" x2="${W}" y1="${y(avg)}" y2="${y(avg)}" stroke="var(--blue-light)" stroke-width="2" stroke-dasharray="8 7"/>`;
+  if (avg != null) svg += `<line x1="${padL}" x2="${W}" y1="${y(avg)}" y2="${y(avg)}" stroke="var(--yellow)" stroke-width="2" stroke-dasharray="8 7"/>`;
   svg += '</svg>';
   el.innerHTML = svg;
   const rects = $$('.bar', el);
@@ -1395,7 +1438,7 @@ function viewFuel() {
     const per = document.createElement('section');
     per.className = 'panel';
     per.innerHTML = `<div class="panel-head"><h2 class="label">Verbruik per tank</h2><div class="spacer"></div>
-      ${avg != null ? `<span class="legend"><span><i style="background:var(--blue-light)"></i>gemiddeld ${fmt.num(avg, 1)} l/100 km${official ? ` · opgave ${fmt.num(official, 1)}` : ''}</span></span>` : ''}</div>
+      ${avg != null ? `<span class="legend"><span><i style="background:var(--yellow)"></i>gemiddeld ${fmt.num(avg, 1)} l/100 km${official ? ` · opgave ${fmt.num(official, 1)}` : ''}</span></span>` : ''}</div>
       <div class="chart" id="fuel-tanks"></div>`;
     p.appendChild(per);
     if (intervals.length) {
